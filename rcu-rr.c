@@ -36,11 +36,15 @@ static struct workqueue_struct *s_wq;
 static bool stop_please;
 static u64 observed_null_jiffies;
 
-#define THROTTLE_ADD_SECS 10
-
 static struct work_struct s_io_works[NR_CPUS];
-static struct delayed_work s_add_works[NR_CPUS];
-static struct delayed_work s_rm_works[NR_CPUS];
+static struct delayed_work s_add_work;
+
+/*
+ * Flag is needed to catch @remove_conn_from_arr just in the middle,
+ * when @conn is removed from list, but @ppcpu_conn pointers are
+ * not yet updated.
+ */
+static bool in_the_middle_of_rm;
 
 static void rcu_rr_start(void);
 static void rcu_rr_stop(void);
@@ -49,8 +53,6 @@ static inline void remove_conn_from_arr(struct conn *conn);
 static int get_stats(char *buffer, const struct kernel_param *kp)
 {
 	struct stats stats, *s;
-	char throttle_buf[32];
-	u64 throttle_jiffies;
 	int cpu;
 
 	memset(&stats, 0, sizeof(stats));
@@ -66,29 +68,20 @@ static int get_stats(char *buffer, const struct kernel_param *kp)
 		stats.adds_num += s->adds_num;
 	}
 
-	throttle_jiffies = observed_null_jiffies + HZ * THROTTLE_ADD_SECS;
-	if (time_is_before_jiffies64(throttle_jiffies))
-		snprintf(throttle_buf, sizeof(throttle_buf),
-			 "NOW");
-	else
-		snprintf(throttle_buf, sizeof(throttle_buf), "%u secs",
-			 jiffies_to_msecs(throttle_jiffies - get_jiffies_64())
-			 /1000);
-
 	return snprintf(buffer, 4096,
-			"Throttle add in:    %s\n\n"
 			"IO observed valid:  %llu\n"
 			"IO observed nulls:  %llu\n"
+			"IO found dangl ptr: %llu\n"
 			"IO double sync rcu: %llu\n"
-			"IO found dangl ptr: %llu\n\n"
+			"\n"
 			"RM observed valid:  %llu\n"
-			"RM observed nulls:  %llu\n\n"
+			"RM observed nulls:  %llu\n"
+			"\n"
 			"Adds: %llu\n",
-			throttle_buf,
 			stats.io_observed_valid_num,
 			stats.io_observed_nulls_num,
-			stats.io_doubl_sync_rcu_num,
 			stats.io_found_dang_ptr_num,
+			stats.io_doubl_sync_rcu_num,
 			stats.rm_observed_valid_num,
 			stats.rm_observed_nulls_num,
 			stats.adds_num);
@@ -126,7 +119,6 @@ module_param_cb(stop, &stop_ops, NULL, 0200);
 static void free_conn(struct conn *conn)
 {
 	conn->deleted = true;
-	smp_wmb();
 	kfree(conn);
 }
 
@@ -189,6 +181,28 @@ static inline struct conn *get_next_conn_rr(void)
 
 	ppcpu_conn = this_cpu_ptr(s_pcpu_conn);
 	conn = rcu_dereference(*ppcpu_conn);
+
+	/*
+	 * Here we help to increase probability to take path in
+	 * remove_conn_from_arr() where second synchronize_rcu() is
+	 * required.  The thing is that list_next_or_null_rr_rcu()
+	 * returns NULL and this NULL is assigned to @ppcpu_conn
+	 * if @conn has been already removed from the list.  This
+	 * assignment decreases probability to detect that second
+	 * synchronize_rcu() is required.  So do not overwrite
+	 * pointer if we are not in the middle if remove procedure.
+	 *
+	 * One can think that this is not fair, we do not pick up
+	 * next, we do not do round-robin.  No, it is fair, because
+	 * a) we have only one element, so list_next_or_null_rr_rcu()
+	 *    returns always the same element if list has only one.
+	 * b) nobody guarantees the exact moment when get_next_conn_rr()
+	 *    can be called, so here we just try to reassign the pointer
+	 *    in exact "dangerous" moment.
+	 */
+	if (!in_the_middle_of_rm)
+		return conn;
+
 	if (unlikely(!conn))
 		conn = list_first_or_null_rcu(&s_conns_list,
 					      typeof(*conn), entry);
@@ -231,6 +245,8 @@ static inline void remove_conn_from_arr(struct conn *conn)
 
 	/* Make sure everybody observes conn removal. */
 	synchronize_rcu();
+
+	in_the_middle_of_rm = true;
 
 	/*
 	 * At this point nobody sees @conn in the list, but still we have
@@ -280,22 +296,13 @@ static inline void remove_conn_from_arr(struct conn *conn)
 			wait_for_grace = true;
 	}
 	if (wait_for_grace) {
-		synchronize_rcu();
 		this_cpu_ptr(s_pcpu_stats)->io_doubl_sync_rcu_num++;
+		synchronize_rcu();
 	}
+
+	in_the_middle_of_rm = false;
 
 	mutex_unlock(&s_conns_mutex);
-}
-
-static inline void __do_udelay(unsigned int delay_us)
-{
-	unsigned int d;
-
-	while (delay_us) {
-		d = min(delay_us, 1000u);
-		udelay(d);
-		delay_us -= d;
-	}
 }
 
 static void run_io_work(struct work_struct *work)
@@ -305,15 +312,10 @@ static void run_io_work(struct work_struct *work)
 	rcu_read_lock();
 	conn = get_next_conn_rr();
 	if (likely(conn)) {
-		smp_rmb();
 		WARN_ON(conn->deleted);
 		this_cpu_ptr(s_pcpu_stats)->io_observed_valid_num++;
 	} else
 		this_cpu_ptr(s_pcpu_stats)->io_observed_nulls_num++;
-
-	/* Emulate some load or interrupt in-between, max 2 ms */
-	__do_udelay(prandom_u32_max(2000));
-
 	if (likely(conn))
 		WARN_ON(conn->deleted);
 	rcu_read_unlock();
@@ -323,24 +325,11 @@ static void run_io_work(struct work_struct *work)
 		queue_work(s_wq, work);
 }
 
-static void run_add_work(struct work_struct *work)
+static void create_and_add_conn(void)
 {
-	struct delayed_work *dwork = to_delayed_work(work);
 	struct conn *conn;
 	struct stats *s;
-	int delay = msecs_to_jiffies(1);
-
-	if (time_is_before_jiffies64(observed_null_jiffies +
-				     HZ * THROTTLE_ADD_SECS)) {
-		/*
-		 * To have proper testing list should bounce from empty
-		 * to filled.  Remove @conn from the list is always
-		 * slower since it requires synchronize_rcu(), so give
-		 * the list 10 seconds to fill in and then throttle.
-		 */
-		delay = msecs_to_jiffies(100);
-		goto repeat;
-	}
+	int cpu;
 
 	conn = kzalloc(sizeof(*conn), GFP_KERNEL);
 	if (!WARN_ON(!conn)) {
@@ -349,15 +338,22 @@ static void run_add_work(struct work_struct *work)
 		s->adds_num++;
 		put_cpu_ptr(s_pcpu_stats);
 	}
-repeat:
-	if (!stop_please)
-		/* Repeat */
-		queue_delayed_work(s_wq, dwork, delay);
+
+	/*
+	 * Always set @ppcpu_conn to just created connection,
+	 * that helps @remove_conn_from_arr() path to observe
+	 * valid pointer and call second synchronize_rcu().
+	 */
+	for_each_possible_cpu(cpu) {
+		struct conn __rcu **ppcpu_conn;
+
+		ppcpu_conn = per_cpu_ptr(s_pcpu_conn, cpu);
+		rcu_assign_pointer(*ppcpu_conn, conn);
+	}
 }
 
-static void run_rm_work(struct work_struct *work)
+static inline void rm_conn(void)
 {
-	struct delayed_work *dwork = to_delayed_work(work);
 	struct conn *conn;
 
 	mutex_lock(&s_rm_mutex);
@@ -373,6 +369,22 @@ static void run_rm_work(struct work_struct *work)
 		observed_null_jiffies = get_jiffies_64();
 	}
 	mutex_unlock(&s_rm_mutex);
+}
+
+static void run_rm_add_work(struct work_struct *work)
+{
+	struct delayed_work *dwork = to_delayed_work(work);
+
+	static bool iam_rm = true;
+
+	if (iam_rm) {
+		rm_conn();
+	} else {
+		create_and_add_conn();
+	}
+
+	/* Toggle */
+	iam_rm ^= 1;
 
 	if (!stop_please)
 		/* Repeat */
@@ -393,6 +405,9 @@ static void rcu_rr_start(void)
 	for_each_possible_cpu(cpu)
 		memset(per_cpu_ptr(s_pcpu_stats, cpu), 0, sizeof(struct stats));
 
+	/* Create one connection */
+	create_and_add_conn();
+
 	/*
 	 * Start IO works
 	 */
@@ -404,23 +419,13 @@ static void rcu_rr_start(void)
 	}
 
 	/*
-	 * Start add works
+	 * Schedule one work in 1 second
 	 */
-	for_each_online_cpu(cpu) {
-		struct delayed_work *work = &s_add_works[cpu];
+	{
+		struct delayed_work *work = &s_add_work;
 
-		INIT_DELAYED_WORK(work, run_add_work);
-		queue_delayed_work(s_wq, work, 0);
-	}
-
-	/*
-	 * Start rm works
-	 */
-	for_each_online_cpu(cpu) {
-		struct delayed_work *work = &s_rm_works[cpu];
-
-		INIT_DELAYED_WORK(work, run_rm_work);
-		queue_delayed_work(s_wq, work, 0);
+		INIT_DELAYED_WORK(work, run_rm_add_work);
+		queue_delayed_work(s_wq, work, HZ);
 	}
 
 	mutex_unlock(&s_mutex);
@@ -432,6 +437,11 @@ static void rcu_rr_stop(void)
 	mutex_lock(&s_mutex);
 	stop_please = true;
 	drain_workqueue(s_wq);
+	/*
+	 * drain_workqueue() does not flush delayed works!
+	 * !!! Has to be fixed in workqueue.c???? !!!
+	 */
+	flush_delayed_work(&s_add_work);
 	free_conns_list();
 	stop_please = false;
 	mutex_unlock(&s_mutex);
